@@ -16,6 +16,34 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connect::LanMouseConnection;
 
+#[cfg(feature = "clipboard")]
+async fn read_clipboard() -> Option<String> {
+    match tokio::task::spawn_blocking(|| arboard::Clipboard::new().and_then(|mut c| c.get_text()))
+        .await
+    {
+        Ok(Ok(text)) => Some(text),
+        Ok(Err(e)) => {
+            log::warn!("failed to read clipboard: {e}");
+            None
+        }
+        Err(e) => {
+            log::warn!("clipboard task panicked: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "clipboard")]
+async fn write_clipboard(text: String) {
+    let result = tokio::task::spawn_blocking(move || {
+        arboard::Clipboard::new().and_then(|mut c| c.set_text(text))
+    })
+    .await;
+    if let Err(e) = result {
+        log::warn!("failed to write clipboard: {e}");
+    }
+}
+
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
     request_tx: Sender<CaptureRequest>,
@@ -290,6 +318,11 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // remote sent its clipboard (arrives before Leave/Ack)
+                        ProtoEvent::Clipboard(text) => {
+                            #[cfg(feature = "clipboard")]
+                            write_clipboard(text).await;
+                        }
                         _ => {}
                     }
                 },
@@ -352,6 +385,14 @@ impl CaptureTask {
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
+
+            // Push local clipboard to the remote before the Enter event.
+            #[cfg(feature = "clipboard")]
+            if let Some(text) = read_clipboard().await {
+                if let Err(e) = self.conn.send(ProtoEvent::Clipboard(text), handle).await {
+                    log::warn!("failed to send clipboard to {handle}: {e}");
+                }
+            }
         }
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());

@@ -1,4 +1,32 @@
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+
+#[cfg(feature = "clipboard")]
+async fn read_clipboard() -> Option<String> {
+    match tokio::task::spawn_blocking(|| arboard::Clipboard::new().and_then(|mut c| c.get_text()))
+        .await
+    {
+        Ok(Ok(text)) => Some(text),
+        Ok(Err(e)) => {
+            log::warn!("failed to read clipboard: {e}");
+            None
+        }
+        Err(e) => {
+            log::warn!("clipboard task panicked: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "clipboard")]
+async fn write_clipboard(text: String) {
+    let result = tokio::task::spawn_blocking(move || {
+        arboard::Clipboard::new().and_then(|mut c| c.set_text(text))
+    })
+    .await;
+    if let Err(e) = result {
+        log::warn!("failed to write clipboard: {e}");
+    }
+}
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
@@ -145,8 +173,18 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                // Send our clipboard to the remote before acknowledging so
+                                // the remote's capture task receives it before Leave.
+                                #[cfg(feature = "clipboard")]
+                                if let Some(text) = read_clipboard().await {
+                                    self.listener.reply(addr, ProtoEvent::Clipboard(text)).await;
+                                }
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                            }
+                            ProtoEvent::Clipboard(text) => {
+                                #[cfg(feature = "clipboard")]
+                                write_clipboard(text).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
@@ -171,7 +209,14 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr) => {
+                        // Send our clipboard before Leave so the remote picks it up.
+                        #[cfg(feature = "clipboard")]
+                        if let Some(text) = read_clipboard().await {
+                            self.listener.reply(addr, ProtoEvent::Clipboard(text)).await;
+                        }
+                        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

@@ -33,7 +33,7 @@ input-capture = { path = "input-capture", version = "0.3.0", default-features = 
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.2.0" }
 lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.2.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.2.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.2.0" }
+lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
 hickory-resolver = "0.25.2"
@@ -68,12 +68,14 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+arboard = { version = "3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
 
 [features]
 default = [
+    "clipboard",
     "gtk",
     "layer_shell_capture",
     "x11_capture",
@@ -83,6 +85,7 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
+clipboard = ["dep:arboard"]
 gtk = ["dep:lan-mouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]

@@ -12,6 +12,10 @@ use thiserror::Error;
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
+/// maximum size of any protocol message, including variable-length clipboard payloads
+/// clipboard: 1 byte type + 4 bytes length + up to 64 KiB of UTF-8 text
+pub const MAX_PROTO_MSG_SIZE: usize = 1 + 4 + 64 * 1024;
+
 /// error type for protocol violations
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -21,6 +25,12 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// clipboard payload is shorter than the declared length
+    #[error("clipboard payload is truncated")]
+    TruncatedClipboard,
+    /// clipboard payload is not valid UTF-8
+    #[error("clipboard payload is not valid UTF-8")]
+    InvalidUtf8Clipboard,
 }
 
 /// Position of a client
@@ -46,7 +56,7 @@ impl Display for Position {
 }
 
 /// main lan-mouse protocol event type
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
@@ -63,6 +73,9 @@ pub enum ProtoEvent {
     Ping,
     /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
     Pong(bool),
+    /// Clipboard text sync — sent at cursor transition points so the receiving
+    /// device can set its local clipboard.
+    Clipboard(String),
 }
 
 impl Display for ProtoEvent {
@@ -80,6 +93,7 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
+            ProtoEvent::Clipboard(text) => write!(f, "Clipboard({} bytes)", text.len()),
         }
     }
 }
@@ -98,6 +112,7 @@ pub enum EventType {
     Enter,
     Leave,
     Ack,
+    Clipboard,
 }
 
 impl ProtoEvent {
@@ -120,15 +135,16 @@ impl ProtoEvent {
             ProtoEvent::Enter(_) => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
+            ProtoEvent::Clipboard(_) => EventType::Clipboard,
         }
     }
 }
 
-impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
+impl TryFrom<&[u8]> for ProtoEvent {
     type Error = ProtocolError;
 
-    fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
-        let mut buf = &buf[..];
+    fn try_from(buf: &[u8]) -> Result<Self, Self::Error> {
+        let mut buf = buf;
         let event_type = decode_u8(&mut buf)?;
         match EventType::try_from(event_type)? {
             EventType::PointerMotion => {
@@ -174,16 +190,34 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
+            EventType::Clipboard => {
+                let len = decode_u32(&mut buf)? as usize;
+                let text_bytes = buf.get(..len).ok_or(ProtocolError::TruncatedClipboard)?;
+                let text = String::from_utf8(text_bytes.to_vec())
+                    .map_err(|_| ProtocolError::InvalidUtf8Clipboard)?;
+                Ok(Self::Clipboard(text))
+            }
         }
     }
 }
 
-impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
+impl From<ProtoEvent> for Vec<u8> {
     fn from(event: ProtoEvent) -> Self {
-        let mut buf = [0u8; MAX_EVENT_SIZE];
+        // Clipboard has a variable-length payload — encode separately.
+        if let ProtoEvent::Clipboard(ref text) = event {
+            let bytes = text.as_bytes();
+            let mut buf = Vec::with_capacity(1 + 4 + bytes.len());
+            buf.push(EventType::Clipboard as u8);
+            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(bytes);
+            return buf;
+        }
+
+        // All other events fit within MAX_EVENT_SIZE.
+        let mut fixed = [0u8; MAX_EVENT_SIZE];
         let mut len = 0usize;
         {
-            let mut buf = &mut buf[..];
+            let mut buf = &mut fixed[..];
             let buf = &mut buf;
             let len = &mut len;
             encode_u8(buf, len, event.event_type() as u8);
@@ -238,9 +272,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
+                ProtoEvent::Clipboard(_) => unreachable!(),
             }
         }
-        (buf, len)
+        fixed[..len].to_vec()
     }
 }
 

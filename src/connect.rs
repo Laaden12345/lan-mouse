@@ -1,6 +1,6 @@
 use crate::client::ClientManager;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{MAX_PROTO_MSG_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -124,8 +124,8 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let buf = &buf[..len];
+        let event_display = format!("{event}");
+        let buf: Vec<u8> = event.into();
         if let Some(addr) = self.client_manager.active_addr(handle) {
             let conn = {
                 let conns = self.conns.lock().await;
@@ -135,14 +135,14 @@ impl LanMouseConnection {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(buf).await {
+                match conn.send(&buf).await {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(&self.client_manager, handle, addr, &self.conns).await;
                     }
                 }
-                log::trace!("{event} >->->->->- {addr}");
+                log::trace!("{event_display} >->->->->- {addr}");
                 return Ok(());
             }
         }
@@ -222,11 +222,11 @@ async fn ping_pong(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
     loop {
-        let (buf, len) = ProtoEvent::Ping.into();
+        let buf: Vec<u8> = ProtoEvent::Ping.into();
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
-            if let Err(e) = conn.send(&buf[..len]).await {
+            if let Err(e) = conn.send(&buf).await {
                 log::warn!("{addr}: send error `{e}`, closing connection");
                 let _ = conn.close().await;
                 break;
@@ -253,18 +253,23 @@ async fn receive_loop(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        if let Ok(event) = buf.try_into() {
-            log::trace!("{addr} <==<==<== {event}");
-            match event {
-                ProtoEvent::Pong(b) => {
-                    client_manager.set_active_addr(handle, Some(addr));
-                    client_manager.set_alive(handle, b);
-                    ping_response.borrow_mut().insert(addr);
+    let mut buf = vec![0u8; MAX_PROTO_MSG_SIZE];
+    loop {
+        match conn.recv(&mut buf).await {
+            Ok(n) => {
+                if let Ok(event) = ProtoEvent::try_from(&buf[..n]) {
+                    log::trace!("{addr} <==<==<== {event}");
+                    match event {
+                        ProtoEvent::Pong(b) => {
+                            client_manager.set_active_addr(handle, Some(addr));
+                            client_manager.set_alive(handle, b);
+                            ping_response.borrow_mut().insert(addr);
+                        }
+                        event => tx.send((handle, event)).expect("channel closed"),
+                    }
                 }
-                event => tx.send((handle, event)).expect("channel closed"),
             }
+            Err(_) => break,
         }
     }
     log::warn!("recv error");

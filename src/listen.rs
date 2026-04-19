@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{MAX_PROTO_MSG_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
@@ -205,11 +205,11 @@ impl LanMouseListener {
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        let buf: Vec<u8> = event.into();
         let conns = self.conns.lock().await;
         for (a, conn) in conns.iter() {
             if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+                let _ = conn.send(&buf).await;
             }
         }
     }
@@ -251,17 +251,20 @@ async fn read_loop(
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_EVENT_SIZE];
+    let mut b = vec![0u8; MAX_PROTO_MSG_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
-            Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
-            Err(e) => {
-                log::warn!("error receiving event: {e}");
-                break;
-            }
+    loop {
+        match conn.recv(&mut b).await {
+            Ok(n) => match ProtoEvent::try_from(&b[..n]) {
+                Ok(event) => dtls_tx
+                    .send(ListenEvent::Msg { event, addr })
+                    .expect("channel closed"),
+                Err(e) => {
+                    log::warn!("error receiving event: {e}");
+                    break;
+                }
+            },
+            Err(_) => break,
         }
     }
     log::info!("dtls client disconnected {addr:?}");
